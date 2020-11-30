@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"unsafe"
 
+	"github.com/cznic/mathutil"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/parser/charset"
 	"github.com/pingcap/parser/model"
@@ -64,8 +65,10 @@ type lookupTableTask struct {
 	handles []kv.Handle
 	rowIdx  []int // rowIdx represents the handle index for every row. Only used when keep order.
 	rows    []chunk.Row
+	chk     *chunk.Chunk
 	idxRows *chunk.Chunk
 	cursor  int
+	numRows int
 
 	doneCh chan error
 
@@ -104,6 +107,17 @@ func (task *lookupTableTask) Less(i, j int) bool {
 func (task *lookupTableTask) Swap(i, j int) {
 	task.rowIdx[i], task.rowIdx[j] = task.rowIdx[j], task.rowIdx[i]
 	task.rows[i], task.rows[j] = task.rows[j], task.rows[i]
+}
+
+func (task *lookupTableTask) buildResultChunk() {
+	if task.numRows <= 0 {
+		return
+	}
+	if task.rows[0].Chunk() != nil {
+		task.chk = chunk.Renew(task.rows[0].Chunk(), task.rows[0].Chunk().NumRows())
+		task.chk.AppendRows(task.rows)
+	}
+	task.rows = nil
 }
 
 // Closeable is a interface for closeable structures.
@@ -613,9 +627,10 @@ func (e *IndexLookUpExecutor) Next(ctx context.Context, req *chunk.Chunk) error 
 		if resultTask == nil {
 			return nil
 		}
-		for resultTask.cursor < len(resultTask.rows) {
-			req.AppendRow(resultTask.rows[resultTask.cursor])
-			resultTask.cursor++
+		if resultTask.cursor < resultTask.numRows {
+			numToAppend := mathutil.Min(resultTask.numRows-resultTask.cursor, req.RequiredRows()-req.NumRows())
+			req.Append(resultTask.chk, resultTask.cursor, resultTask.cursor+numToAppend)
+			resultTask.cursor += numToAppend
 			if req.IsFull() {
 				return nil
 			}
@@ -624,7 +639,7 @@ func (e *IndexLookUpExecutor) Next(ctx context.Context, req *chunk.Chunk) error 
 }
 
 func (e *IndexLookUpExecutor) getResultTask() (*lookupTableTask, error) {
-	if e.resultCurr != nil && e.resultCurr.cursor < len(e.resultCurr.rows) {
+	if e.resultCurr != nil && e.resultCurr.cursor < e.resultCurr.numRows {
 		return e.resultCurr, nil
 	}
 	task, ok := <-e.resultCh
@@ -970,7 +985,10 @@ func (w *tableWorker) executeTask(ctx context.Context, task *lookupTableTask) er
 	task.memUsage = memUsage
 	task.memTracker.Consume(memUsage)
 	handleCnt := len(task.handles)
-	task.rows = make([]chunk.Row, 0, handleCnt)
+	if w.keepOrder {
+		task.rows = make([]chunk.Row, 0, handleCnt)
+	}
+	task.numRows = 0
 	for {
 		chk := newFirstChunk(tableReader)
 		err = Next(ctx, tableReader, chk)
@@ -984,9 +1002,18 @@ func (w *tableWorker) executeTask(ctx context.Context, task *lookupTableTask) er
 		memUsage = chk.MemoryUsage()
 		task.memUsage += memUsage
 		task.memTracker.Consume(memUsage)
-		iter := chunk.NewIterator4Chunk(chk)
-		for row := iter.Begin(); row != iter.End(); row = iter.Next() {
-			task.rows = append(task.rows, row)
+		if w.keepOrder {
+			iter := chunk.NewIterator4Chunk(chk)
+			for row := iter.Begin(); row != iter.End(); row = iter.Next() {
+				task.rows = append(task.rows, row)
+				task.numRows++
+			}
+		} else {
+			if task.chk == nil {
+				task.chk = chunk.Renew(chk, chk.NumRows())
+			}
+			task.chk.Append(chk, 0, chk.NumRows())
+			task.numRows += chk.NumRows()
 		}
 	}
 
@@ -1008,13 +1035,14 @@ func (w *tableWorker) executeTask(ctx context.Context, task *lookupTableTask) er
 		task.memUsage += memUsage
 		task.memTracker.Consume(memUsage)
 		sort.Sort(task)
+		task.buildResultChunk()
 	}
 
-	if handleCnt != len(task.rows) && !util.HasCancelled(ctx) {
+	if handleCnt != task.numRows && !util.HasCancelled(ctx) {
 		if len(w.idxLookup.tblPlans) == 1 {
 			obtainedHandlesMap := kv.NewHandleMap()
-			for _, row := range task.rows {
-				handle, err := w.idxLookup.getHandle(row, w.handleIdx, w.idxLookup.isCommonHandle(), getHandleFromTable)
+			for i := 0; i < task.numRows; i++ {
+				handle, err := w.idxLookup.getHandle(task.chk.GetRow(i), w.handleIdx, w.idxLookup.isCommonHandle(), getHandleFromTable)
 				if err != nil {
 					return err
 				}
@@ -1022,14 +1050,14 @@ func (w *tableWorker) executeTask(ctx context.Context, task *lookupTableTask) er
 			}
 
 			logutil.Logger(ctx).Error("inconsistent index handles", zap.String("index", w.idxLookup.index.Name.O),
-				zap.Int("index_cnt", handleCnt), zap.Int("table_cnt", len(task.rows)),
+				zap.Int("index_cnt", handleCnt), zap.Int("table_cnt", task.numRows),
 				zap.String("missing_handles", fmt.Sprint(GetLackHandles(task.handles, obtainedHandlesMap))),
 				zap.String("total_handles", fmt.Sprint(task.handles)))
 
 			// table scan in double read can never has conditions according to convertToIndexScan.
 			// if this table scan has no condition, the number of rows it returns must equal to the length of handles.
 			return errors.Errorf("inconsistent index %s handle count %d isn't equal to value count %d",
-				w.idxLookup.index.Name.O, handleCnt, len(task.rows))
+				w.idxLookup.index.Name.O, handleCnt, task.numRows)
 		}
 	}
 
