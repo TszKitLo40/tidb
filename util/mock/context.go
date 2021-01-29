@@ -71,7 +71,7 @@ func (c *Context) Execute(ctx context.Context, sql string) ([]sqlexec.RecordSet,
 }
 
 // ExecuteInternal implements sqlexec.SQLExecutor ExecuteInternal interface.
-func (c *Context) ExecuteInternal(ctx context.Context, sql string) ([]sqlexec.RecordSet, error) {
+func (c *Context) ExecuteInternal(ctx context.Context, sql string, args ...interface{}) ([]sqlexec.RecordSet, error) {
 	return nil, errors.Errorf("Not Support.")
 }
 
@@ -198,6 +198,11 @@ func (c *Context) InitTxnWithStartTS(startTS uint64) error {
 		c.txn.Transaction = txn
 	}
 	return nil
+}
+
+// NewTxnWithStalenessOption implements the sessionctx.Context interface.
+func (c *Context) NewTxnWithStalenessOption(ctx context.Context, option sessionctx.StalenessTxnOption) error {
+	return c.NewTxn(ctx)
 }
 
 // GetStore gets the store of session.

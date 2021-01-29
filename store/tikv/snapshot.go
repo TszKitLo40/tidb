@@ -30,11 +30,11 @@ import (
 	"github.com/pingcap/failpoint"
 	pb "github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/metrics"
+	"github.com/pingcap/tidb/store/tikv/logutil"
+	"github.com/pingcap/tidb/store/tikv/metrics"
 	"github.com/pingcap/tidb/store/tikv/tikvrpc"
 	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/util/execdetails"
-	"github.com/pingcap/tidb/util/logutil"
 	"go.uber.org/zap"
 )
 
@@ -339,6 +339,9 @@ func (s *tikvSnapshot) batchGetSingleRegion(bo *Backoffer, batch batchKeys, coll
 				locks = append(locks, lock)
 			}
 		}
+		if batchGetResp.ExecDetailsV2 != nil {
+			s.mergeExecDetail(batchGetResp.ExecDetailsV2)
+		}
 		if len(lockedKeys) > 0 {
 			msBeforeExpired, err := cli.ResolveLocks(bo, s.version.Ver, locks)
 			if err != nil {
@@ -456,6 +459,9 @@ func (s *tikvSnapshot) get(ctx context.Context, bo *Backoffer, k kv.Key) ([]byte
 			return nil, errors.Trace(ErrBodyMissing)
 		}
 		cmdGetResp := resp.Resp.(*pb.GetResponse)
+		if cmdGetResp.ExecDetailsV2 != nil {
+			s.mergeExecDetail(cmdGetResp.ExecDetailsV2)
+		}
 		val := cmdGetResp.GetValue()
 		if keyErr := cmdGetResp.GetError(); keyErr != nil {
 			lock, err := extractLockFromKeyErr(keyErr)
@@ -476,6 +482,22 @@ func (s *tikvSnapshot) get(ctx context.Context, bo *Backoffer, k kv.Key) ([]byte
 		}
 		return val, nil
 	}
+}
+
+func (s *tikvSnapshot) mergeExecDetail(detail *pb.ExecDetailsV2) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if detail == nil || s.mu.stats == nil {
+		return
+	}
+	if s.mu.stats.scanDetail == nil {
+		s.mu.stats.scanDetail = &execdetails.ScanDetail{}
+	}
+	if s.mu.stats.timeDetail == nil {
+		s.mu.stats.timeDetail = &execdetails.TimeDetail{}
+	}
+	s.mu.stats.scanDetail.MergeFromScanDetailV2(detail.ScanDetailV2)
+	s.mu.stats.timeDetail.MergeFromTimeDetail(detail.TimeDetail)
 }
 
 // Iter return a list of key-value pair after `k`.
@@ -565,12 +587,12 @@ func extractLockFromKeyErr(keyErr *pb.KeyError) (*Lock, error) {
 }
 
 func extractKeyErr(keyErr *pb.KeyError) error {
-	failpoint.Inject("ErrMockRetryableOnly", func(val failpoint.Value) {
+	if val, err := MockRetryableErrorResp.Eval(); err == nil {
 		if val.(bool) {
 			keyErr.Conflict = nil
 			keyErr.Retryable = "mock retryable error"
 		}
-	})
+	}
 
 	if keyErr.Conflict != nil {
 		return newWriteConflictError(keyErr.Conflict)
@@ -720,6 +742,8 @@ type SnapshotRuntimeStats struct {
 	rpcStats       RegionRequestRuntimeStats
 	backoffSleepMS map[backoffType]int
 	backoffTimes   map[backoffType]int
+	scanDetail     *execdetails.ScanDetail
+	timeDetail     *execdetails.TimeDetail
 }
 
 // Tp implements the RuntimeStats interface.
@@ -787,6 +811,16 @@ func (rs *SnapshotRuntimeStats) String() string {
 		ms := rs.backoffSleepMS[k]
 		d := time.Duration(ms) * time.Millisecond
 		buf.WriteString(fmt.Sprintf("%s_backoff:{num:%d, total_time:%s}", k.String(), v, execdetails.FormatDuration(d)))
+	}
+	timeDetail := rs.timeDetail.String()
+	if timeDetail != "" {
+		buf.WriteString(", ")
+		buf.WriteString(timeDetail)
+	}
+	scanDetail := rs.scanDetail.String()
+	if scanDetail != "" {
+		buf.WriteString(", ")
+		buf.WriteString(scanDetail)
 	}
 	return buf.String()
 }

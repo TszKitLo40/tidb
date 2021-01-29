@@ -198,6 +198,15 @@ func (s *testSuite8) TestInsertOnDuplicateKey(c *C) {
 	c.Assert(tk.Se.AffectedRows(), Equals, uint64(7))
 	tk.CheckLastMessage("Records: 5  Duplicates: 2  Warnings: 0")
 
+	tk.MustExec("drop table if exists a, b")
+	tk.MustExec("create table a(x int primary key)")
+	tk.MustExec("create table b(x int, y int)")
+	tk.MustExec("insert into a values(1)")
+	tk.MustExec("insert into b values(1, 2)")
+	tk.MustExec("insert into a select x from b ON DUPLICATE KEY UPDATE a.x=b.y")
+	c.Assert(tk.Se.AffectedRows(), Equals, uint64(2))
+	tk.MustQuery("select * from a").Check(testkit.Rows("2"))
+
 	// reproduce insert on duplicate key update bug under new row format.
 	tk.MustExec(`drop table if exists t1`)
 	tk.MustExec(`create table t1(c1 decimal(6,4), primary key(c1))`)
@@ -1497,6 +1506,13 @@ func (s *testSerialSuite) TestDuplicateEntryMessage(c *C) {
 		tk.MustExec("insert into t values ('a7', 'a', 10);")
 		tk.MustGetErrMsg("insert into t values ('a7', 'a', 10);", "[kv:1062]Duplicate entry 'a7-a-10' for key 'PRIMARY'")
 		tk.MustExec("rollback;")
+
+		// Test for large unsigned integer handle.
+		// See https://github.com/pingcap/tidb/issues/12420.
+		tk.MustExec("drop table if exists t;")
+		tk.MustExec("create table t(a bigint unsigned primary key);")
+		tk.MustExec("insert into t values(18446744073709551615);")
+		tk.MustGetErrMsg("insert into t values(18446744073709551615);", "[kv:1062]Duplicate entry '18446744073709551615' for key 'PRIMARY'")
 	}
 }
 
