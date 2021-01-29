@@ -1709,7 +1709,7 @@ func (c *fromUnixTimeFunctionClass) getFunction(ctx sessionctx.Context, args []E
 }
 
 func evalFromUnixTime(ctx sessionctx.Context, fsp int8, unixTimeStamp *types.MyDecimal) (res types.Time, isNull bool, err error) {
-	// 0 <= unixTimeStamp <= INT32_MAX
+	// 0 <= unixTimeStamp <= INT64_MAX
 	if unixTimeStamp.IsNegative() {
 		return res, true, nil
 	}
@@ -1717,7 +1717,7 @@ func evalFromUnixTime(ctx sessionctx.Context, fsp int8, unixTimeStamp *types.MyD
 	if err != nil && !terror.ErrorEqual(err, types.ErrTruncated) {
 		return res, true, err
 	}
-	if integralPart > int64(math.MaxInt32) {
+	if integralPart > int64(math.MaxInt64) {
 		return res, true, nil
 	}
 	// Split the integral part and fractional part of a decimal timestamp.

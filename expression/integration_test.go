@@ -2901,10 +2901,13 @@ func (s *testIntegrationSuite2) TestBuiltin(c *C) {
 	unixTime = time.Unix(1451606400, 999999000).In(tz).String()[:26]
 	result.Check(testkit.Rows(unixTime))
 	result = tk.MustQuery("select from_unixtime(1511247196661)")
-	result.Check(testkit.Rows("<nil>"))
+	result.Check(testkit.Rows("0707-07-09 07:57:41"))
 	result = tk.MustQuery("select from_unixtime('1451606400.123');")
 	unixTime = time.Unix(1451606400, 0).In(tz).String()[:19]
 	result.Check(testkit.Rows(fmt.Sprintf("%s.123000", unixTime)))
+	// For issue22206
+	result = tk.MustQuery("select from_unixtime(5000000000)")
+	result.Check(testkit.Rows("2128-06-11 16:53:20"))
 
 	tk.MustExec("drop table if exists t;")
 	tk.MustExec("create table t(a int);")
